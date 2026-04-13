@@ -1,6 +1,7 @@
 """Stock Data API routes."""
-from fastapi import APIRouter, Depends, Query
-from typing import List, Optional
+from typing import Annotated, List, Optional
+
+from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from src.application.services.stock_data_service import StockDataService
@@ -99,7 +100,7 @@ async def get_stock_quote(
 
 @router.post("/quotes", response_model=List[StockQuoteResponse])
 async def get_multiple_quotes(
-    symbols: List[str],
+    symbols: Annotated[List[str], Body(..., description="Danh sách mã chứng khoán")],
     source: str = Query("VCI", description="Nguồn dữ liệu: VCI, TCBS"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
