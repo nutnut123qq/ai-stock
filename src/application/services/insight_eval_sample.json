@@ -1,0 +1,40 @@
+[
+  {
+    "symbol": "VIC",
+    "expected_type": "Buy",
+    "technical_data": {
+      "price": 98400,
+      "rsi": 57.2,
+      "macd": 1.1,
+      "volume": 2134500,
+      "trend": "up"
+    },
+    "fundamental_data": {
+      "roe": 14.2,
+      "eps": 4520
+    },
+    "sentiment_data": {
+      "score": 0.31,
+      "sentiment": "Tích cực"
+    }
+  },
+  {
+    "symbol": "VHM",
+    "expected_type": "Sell",
+    "technical_data": {
+      "price": 43200,
+      "rsi": 39.4,
+      "macd": -0.8,
+      "volume": 4982000,
+      "trend": "down"
+    },
+    "fundamental_data": {
+      "roe": 10.1,
+      "eps": 2880
+    },
+    "sentiment_data": {
+      "score": -0.28,
+      "sentiment": "Tiêu cực"
+    }
+  }
+]
