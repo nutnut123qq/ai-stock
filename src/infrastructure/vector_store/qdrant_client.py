@@ -37,6 +37,34 @@ class QdrantClient(VectorStore):
             logger.error(f"Failed to connect to Qdrant: {str(e)}")
             raise VectorStoreError(f"Failed to connect to Qdrant: {str(e)}") from e
 
+    def _run_vector_query(
+        self,
+        query_vector: List[float],
+        top_k: int,
+        query_filter: Optional[Filter]
+    ):
+        """
+        Run vector query across qdrant-client versions.
+
+        qdrant-client >=1.10 favors `query_points`, while older versions expose
+        `search`. Keep both paths for runtime compatibility.
+        """
+        if hasattr(self.client, "search"):
+            return self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_vector,
+                limit=top_k,
+                query_filter=query_filter
+            )
+
+        query_response = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            limit=top_k,
+            query_filter=query_filter
+        )
+        return getattr(query_response, "points", query_response)
+
     async def search(
         self,
         query_text: str,
@@ -84,11 +112,10 @@ class QdrantClient(VectorStore):
             if filter_conditions:
                 query_filter = Filter(must=filter_conditions)
             
-            # Perform search
-            results = self.client.search(
-                collection_name=self.collection_name,
+            # Perform vector search with client-version compatibility.
+            results = self._run_vector_query(
                 query_vector=query_vector,
-                limit=top_k,
+                top_k=top_k,
                 query_filter=query_filter
             )
             
