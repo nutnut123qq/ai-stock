@@ -1,12 +1,15 @@
 """Stock Data Service - Lấy dữ liệu chứng khoán từ vnstock."""
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, TypeVar
 from datetime import datetime, timedelta
 import pandas as pd
+import random
+import time
 from vnstock import Vnstock, Listing
 from src.shared.logging import get_logger
 from src.shared.exceptions import ServiceUnavailableError, NotFoundError
 
 logger = get_logger(__name__)
+T = TypeVar("T")
 
 
 class StockDataService:
@@ -14,8 +17,33 @@ class StockDataService:
     
     def __init__(self):
         self.listing = Listing()
+        self._client = Vnstock()
         self._cache = {}
         self._cache_ttl = 60  # Cache 60 giây cho real-time data
+        self._max_retries = 2
+        self._base_backoff_seconds = 0.6
+
+    def _execute_with_retry(self, action: Callable[[], T], operation_name: str) -> T:
+        """Retry short transient transport errors from vnstock with jitter."""
+        last_error: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return action()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self._max_retries:
+                    break
+                delay = self._base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
+                logger.warning(
+                    "Retrying %s after %.2fs (attempt %d/%d): %s",
+                    operation_name,
+                    delay,
+                    attempt + 1,
+                    self._max_retries,
+                    str(exc),
+                )
+                time.sleep(delay)
+        raise last_error if last_error else RuntimeError(f"{operation_name} failed")
 
     @staticmethod
     def _normalize_vnd_price(raw_price: float) -> float:
@@ -70,16 +98,19 @@ class StockDataService:
             ServiceUnavailableError: If unable to fetch data from source
         """
         try:
-            stock = Vnstock().stock(symbol=symbol.upper(), source=source)
+            stock = self._client.stock(symbol=symbol.upper(), source=source)
             
             # Lấy dữ liệu 2 ngày gần nhất để tính change
             end_date = datetime.now()
             start_date = end_date - timedelta(days=5)
             
-            df = stock.quote.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date.strftime('%Y-%m-%d'),
-                interval='1D'
+            df = self._execute_with_retry(
+                lambda: stock.quote.history(
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    interval='1D'
+                ),
+                f"get_stock_quote:{symbol.upper()}:{source}"
             )
             
             if df.empty:
@@ -126,6 +157,8 @@ class StockDataService:
             quote = self.get_stock_quote(symbol, source)
             if quote:
                 quotes.append(quote)
+            # A tiny spacing helps avoid burst traffic to upstream.
+            time.sleep(0.05)
         
         return quotes
     
@@ -155,8 +188,11 @@ class StockDataService:
             ServiceUnavailableError: If unable to fetch data from source
         """
         try:
-            stock = Vnstock().stock(symbol=symbol.upper(), source=source)
-            df = stock.quote.history(start=start_date, end=end_date, interval=interval)
+            stock = self._client.stock(symbol=symbol.upper(), source=source)
+            df = self._execute_with_retry(
+                lambda: stock.quote.history(start=start_date, end=end_date, interval=interval),
+                f"get_historical_data:{symbol.upper()}:{source}"
+            )
             
             if df.empty:
                 raise NotFoundError(f"Không tìm thấy dữ liệu lịch sử cho mã {symbol}")
