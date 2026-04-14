@@ -24,18 +24,30 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4 
+        uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies into build context
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir --target build/python -r requirements.txt
+
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        id: buildx
 
       - name: Docker meta
         id: meta
