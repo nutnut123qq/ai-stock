@@ -5,9 +5,13 @@ import pandas as pd
 import random
 import time
 try:
-    from vnstock_data import Vnstock, Listing
+    from vnstock_data import Listing as SponsorListing, Quote as SponsorQuote
+    HAS_VNSTOCK_SPONSOR = True
 except ImportError:
-    from vnstock import Vnstock, Listing
+    SponsorListing = None
+    SponsorQuote = None
+    HAS_VNSTOCK_SPONSOR = False
+from vnstock import Vnstock, Listing as CommunityListing
 from src.shared.logging import get_logger
 from src.shared.exceptions import ServiceUnavailableError, NotFoundError
 
@@ -17,16 +21,28 @@ DEFAULT_SOURCE = "KBS"
 VCI_SOURCE = "VCI"
 
 
+class _SponsorStockClient:
+    """Provide the same `.quote.history(...)` shape used by the service."""
+
+    def __init__(self, symbol: str, source: str):
+        self.quote = SponsorQuote(symbol=symbol, source=source)
+
+
 class StockDataService:
     """Service để lấy dữ liệu chứng khoán từ vnstock"""
     
     def __init__(self):
-        self.listing = Listing()
+        self.listing = SponsorListing(source=DEFAULT_SOURCE) if HAS_VNSTOCK_SPONSOR else CommunityListing()
         self._client = Vnstock()
         self._cache = {}
         self._cache_ttl = 60  # Cache 60 giây cho real-time data
         self._max_retries = 2
         self._base_backoff_seconds = 0.6
+
+    def _build_stock_client(self, symbol: str, source: str):
+        if HAS_VNSTOCK_SPONSOR:
+            return _SponsorStockClient(symbol=symbol.upper(), source=source)
+        return self._client.stock(symbol=symbol.upper(), source=source)
 
     def _execute_with_retry(self, action: Callable[[], T], operation_name: str) -> T:
         """Retry short transient transport errors from vnstock with jitter."""
@@ -64,7 +80,7 @@ class StockDataService:
         operation_name: str,
     ) -> pd.DataFrame:
         normalized_source = source.upper()
-        stock = self._client.stock(symbol=symbol.upper(), source=normalized_source)
+        stock = self._build_stock_client(symbol=symbol, source=normalized_source)
         try:
             return self._execute_with_retry(
                 lambda: stock.quote.history(start=start, end=end, interval=interval),
@@ -81,7 +97,7 @@ class StockDataService:
                 str(exc),
                 DEFAULT_SOURCE,
             )
-            fallback_stock = self._client.stock(symbol=symbol.upper(), source=DEFAULT_SOURCE)
+            fallback_stock = self._build_stock_client(symbol=symbol, source=DEFAULT_SOURCE)
             fallback_operation = f"{operation_name}:fallback:{DEFAULT_SOURCE}"
             return self._execute_with_retry(
                 lambda: fallback_stock.quote.history(start=start, end=end, interval=interval),
