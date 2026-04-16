@@ -80,7 +80,7 @@ async def get_all_symbols(
 @router.get("/quote/{symbol}", response_model=StockQuoteResponse)
 async def get_stock_quote(
     symbol: str,
-    source: str = Query("VCI", description="Nguồn dữ liệu: VCI, TCBS"),
+    source: str = Query("KBS", description="Nguồn dữ liệu: KBS, VCI"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
     """
@@ -101,7 +101,7 @@ async def get_stock_quote(
 @router.post("/quotes", response_model=List[StockQuoteResponse])
 async def get_multiple_quotes(
     symbols: Annotated[List[str], Body(..., description="Danh sách mã chứng khoán")],
-    source: str = Query("VCI", description="Nguồn dữ liệu: VCI, TCBS"),
+    source: str = Query("KBS", description="Nguồn dữ liệu: KBS, VCI"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
     """
@@ -125,7 +125,7 @@ async def get_historical_data(
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="Ngày kết thúc (YYYY-MM-DD)"),
     interval: str = Query("1D", description="Khoảng thời gian: 1D, 1W, 1M"),
-    source: str = Query("VCI", description="Nguồn dữ liệu: VCI, TCBS"),
+    source: str = Query("KBS", description="Nguồn dữ liệu: KBS, VCI"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
     """
@@ -156,7 +156,7 @@ async def get_historical_data(
 
 @router.get("/vn30")
 async def get_vn30_quotes(
-    source: str = Query("VCI", description="Nguồn dữ liệu: VCI, TCBS"),
+    source: str = Query("KBS", description="Nguồn dữ liệu: KBS, VCI"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
     """

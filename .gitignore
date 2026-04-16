@@ -30,6 +30,8 @@ build/
 dist/
 *.egg-info/
 .eggs/
+.build_cli_package/
+vnstock-cli-installer.run
 
 # IDE/editor files
 .vscode/
