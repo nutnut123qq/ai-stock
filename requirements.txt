@@ -22,3 +22,8 @@ pika==1.3.2
 vnstock==3.5.1
 pandas==3.0.2
 numpy==2.4.4
+redis==5.0.8
+rq==1.16.2
+
+# Dev / test dependencies (fake Redis server for unit tests)
+fakeredis==2.23.5

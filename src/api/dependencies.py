@@ -1,23 +1,22 @@
 """Dependency injection for API routes."""
 from functools import lru_cache
+from typing import Optional
+
 from src.infrastructure.llm.gemini_client import GeminiClient
 from src.domain.interfaces.llm_provider import LLMProvider
 from src.infrastructure.vector_store.qdrant_client import QdrantClient
 from src.infrastructure.vector_store.embedding_service import EmbeddingService
+from src.infrastructure.cache.redis_cache import RedisCacheService
 from src.application.services.forecast_service import ForecastService
 from src.application.services.insight_service import InsightService
 from src.application.services.qa_service import QAService
 from src.application.services.summarization_service import SummarizationService
-from src.application.services.sentiment_service import SentimentService
-from src.application.services.nlp_parser_service import NLPParserService
 from src.application.services.stock_data_service import StockDataService
 from src.application.services.rag_ingest_service import RagIngestService
 from src.application.use_cases.summarize_news import SummarizeNewsUseCase
 from src.application.use_cases.answer_question import AnswerQuestionUseCase
 from src.application.use_cases.generate_forecast import GenerateForecastUseCase
 from src.application.use_cases.generate_insight import GenerateInsightUseCase
-from src.application.use_cases.analyze_event import AnalyzeEventUseCase
-from src.application.use_cases.parse_alert import ParseAlertUseCase
 from src.shared.logging import get_logger
 from src.shared.config import get_settings
 
@@ -30,7 +29,13 @@ def get_llm_provider() -> LLMProvider:
     """Get LLM provider singleton. Uses Gemini if GEMINI_API_KEY is set, otherwise falls back to Blackbox."""
     logger.debug("Creating LLM provider instance")
     settings = get_settings()
-    
+
+    if settings.beeknoee_api_key:
+        from src.infrastructure.llm.beeknoee_client import BeeknoeeClient
+
+        logger.info("Using Beeknoee as LLM provider")
+        return BeeknoeeClient(model_name=settings.beeknoee_model)
+
     # Prefer Gemini if API key is available
     if settings.gemini_api_key:
         logger.info("Using Gemini as LLM provider")
@@ -48,6 +53,25 @@ def get_llm_provider() -> LLMProvider:
 
 
 @lru_cache()
+def get_forecast_llm_provider() -> LLMProvider:
+    """Dedicated provider for /api/forecast/generate.
+
+    Forecast prompts are long and Beeknoee's free tier (glm-4.7-flash) frequently
+    hits the Cloudflare 524 origin timeout (~100s upstream). Route only forecast
+    traffic through OpenRouter when ``OPENROUTER_API_KEY`` is configured, falling
+    back to the global provider otherwise so Beeknoee/Gemini/Blackbox still work.
+    """
+    settings = get_settings()
+    if settings.openrouter_api_key:
+        from src.infrastructure.llm.openrouter_client import OpenRouterClient
+
+        logger.info("Using OpenRouter as forecast LLM provider")
+        return OpenRouterClient(model_name=settings.openrouter_model)
+    logger.info("OPENROUTER_API_KEY not set — forecast falls back to default provider")
+    return get_llm_provider()
+
+
+@lru_cache()
 def get_vector_store() -> QdrantClient:
     """Get vector store singleton."""
     logger.debug("Creating vector store instance")
@@ -61,10 +85,50 @@ def get_embedding_service() -> EmbeddingService:
     return EmbeddingService()
 
 
+@lru_cache()
+def get_cache_service() -> Optional[RedisCacheService]:
+    """Get Redis cache singleton.
+
+    Returns ``None`` when caching is disabled by config or the Redis server is
+    unreachable on startup. Callers must treat ``None`` as a fail-open signal.
+    """
+    settings = get_settings()
+    if not settings.vnstock_cache_enabled:
+        logger.info("VNStock cache disabled via VNSTOCK_CACHE_ENABLED=false")
+        return None
+    try:
+        service = RedisCacheService(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password,
+            socket_timeout=settings.redis_socket_timeout,
+            socket_connect_timeout=settings.redis_socket_timeout,
+        )
+        if service.healthcheck():
+            logger.info(
+                "Redis cache ready at %s:%s/db%s",
+                settings.redis_host,
+                settings.redis_port,
+                settings.redis_db,
+            )
+            return service
+        logger.warning(
+            "Redis PING failed at %s:%s/db%s — falling back to no-cache",
+            settings.redis_host,
+            settings.redis_port,
+            settings.redis_db,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — fail-open on any import/connect error
+        logger.warning("Redis cache unavailable, running without cache: %s", exc)
+        return None
+
+
 # Application services
 def get_forecast_service() -> ForecastService:
-    """Get forecast service instance."""
-    return ForecastService(get_llm_provider())
+    """Forecast service uses the dedicated forecast provider (OpenRouter preferred)."""
+    return ForecastService(get_forecast_llm_provider())
 
 
 def get_insight_service() -> InsightService:
@@ -86,19 +150,17 @@ def get_summarization_service() -> SummarizationService:
     return SummarizationService(get_llm_provider())
 
 
-def get_sentiment_service() -> SentimentService:
-    """Get sentiment service instance."""
-    return SentimentService(get_llm_provider())
-
-
-def get_nlp_parser_service() -> NLPParserService:
-    """Get NLP parser service instance."""
-    return NLPParserService(get_llm_provider())
-
-
+@lru_cache()
 def get_stock_data_service() -> StockDataService:
-    """Get stock data service instance."""
-    return StockDataService()
+    """Get stock data service singleton (shares Redis cache across requests)."""
+    settings = get_settings()
+    return StockDataService(
+        cache=get_cache_service(),
+        cache_enabled=settings.vnstock_cache_enabled,
+        quote_ttl=settings.vnstock_cache_quote_ttl,
+        history_ttl=settings.vnstock_cache_history_ttl,
+        symbols_ttl=settings.vnstock_cache_symbols_ttl,
+    )
 
 
 def get_rag_ingest_service() -> RagIngestService:
@@ -128,13 +190,3 @@ def get_generate_forecast_use_case() -> GenerateForecastUseCase:
 def get_generate_insight_use_case() -> GenerateInsightUseCase:
     """Get generate insight use case instance."""
     return GenerateInsightUseCase(get_insight_service())
-
-
-def get_analyze_event_use_case() -> AnalyzeEventUseCase:
-    """Get analyze event use case instance."""
-    return AnalyzeEventUseCase(get_sentiment_service())
-
-
-def get_parse_alert_use_case() -> ParseAlertUseCase:
-    """Get parse alert use case instance."""
-    return ParseAlertUseCase(get_nlp_parser_service())

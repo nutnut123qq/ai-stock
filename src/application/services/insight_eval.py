@@ -55,7 +55,11 @@ def _schema_ok(result: Dict[str, Any]) -> bool:
 
 async def _run_eval(dataset_path: Path, mode: str) -> Dict[str, Any]:
     settings = get_settings()
-    if settings.gemini_api_key:
+    if settings.beeknoee_api_key:
+        from src.infrastructure.llm.beeknoee_client import BeeknoeeClient
+
+        llm_provider = BeeknoeeClient(model_name=settings.beeknoee_model)
+    elif settings.gemini_api_key:
         from src.infrastructure.llm.gemini_client import GeminiClient
         llm_provider = GeminiClient()
     elif settings.openrouter_api_key:

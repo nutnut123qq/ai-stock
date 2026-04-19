@@ -1,12 +1,161 @@
 import json
+import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, TypedDict
 from urllib.parse import quote
 
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
+
+# Shared lock + cooldown so every Beeknoee call (REST client + graph nodes +
+# health probe) goes through the same in-process gate; see
+# ``src/infrastructure/llm/beeknoee_sync.py`` for rationale.
+from src.infrastructure.llm.beeknoee_sync import (
+    BEEKNOEE_API_LOCK as _BEEKNOEE_LLM_LOCK,
+    cooldown as _beeknoee_cooldown,
+)
+
+_log = logging.getLogger(__name__)
+
+
+_RATE_OR_TIMEOUT_TOKENS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "concurrent_limit",
+    "quota",
+    "timeout",
+    "timed out",
+    "resource exhausted",
+    "too many requests",
+)
+
+
+def _is_rate_or_timeout(exc: BaseException) -> bool:
+    raw = str(exc).lower()
+    return any(token in raw for token in _RATE_OR_TIMEOUT_TOKENS)
+
+
+def _openrouter_available() -> bool:
+    return bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
+
+
+def _parse_retry_after_seconds(exc: BaseException, default: float = 10.0) -> float:
+    """Best-effort parse of ``Retry after Ns`` hints inside Beeknoee messages."""
+    raw = str(exc)
+    match = re.search(r"retry after\s+(\d+)\s*s", raw, flags=re.IGNORECASE)
+    if match:
+        try:
+            return min(float(match.group(1)), 20.0)
+        except ValueError:
+            return default
+    return default
+
+
+_OPENROUTER_FALLBACK_LLM: Any = None
+
+
+def _build_openrouter_fallback_llm() -> Any:
+    """Lazy build a ChatOpenAI pointed at OpenRouter for single-shot fallback."""
+    global _OPENROUTER_FALLBACK_LLM
+    if _OPENROUTER_FALLBACK_LLM is not None:
+        return _OPENROUTER_FALLBACK_LLM
+
+    from langchain_openai import ChatOpenAI
+
+    api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY missing; cannot build fallback LLM")
+
+    base_url = (
+        os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+    ).rstrip("/")
+    model = os.getenv("OPENROUTER_MODEL") or "openrouter/free"
+    timeout_s = float(os.getenv("OPENROUTER_TIMEOUT", "120"))
+
+    _OPENROUTER_FALLBACK_LLM = ChatOpenAI(
+        model_name=model,
+        openai_api_key=api_key,
+        openai_api_base=base_url,
+        temperature=0.7,
+        max_retries=1,
+        request_timeout=timeout_s,
+    )
+    return _OPENROUTER_FALLBACK_LLM
+
+
+def _invoke_openrouter_once(messages: list) -> Any:
+    fallback = _build_openrouter_fallback_llm()
+    return fallback.invoke(messages)
+
+
+def _invoke_primary(llm: Any, messages: list) -> Any:
+    if (os.getenv("LLM_PROVIDER") or "ollama").strip().lower() == "beeknoee":
+        with _BEEKNOEE_LLM_LOCK:
+            try:
+                return llm.invoke(messages)
+            finally:
+                # Short grace period so a gateway that keeps the slot reserved
+                # after the HTTP response cannot 429 the very next node.
+                _beeknoee_cooldown()
+    return llm.invoke(messages)
+
+
+def _invoke_llm(llm: Any, messages: list, *, node_name: str = "") -> Any:
+    """Invoke primary LLM with 429/timeout-aware fallback to OpenRouter.
+
+    Behaviour when the primary call raises a rate-limit/timeout error:
+      1. If provider is Beeknoee, sleep a small ``Retry-After``-aware backoff
+         (capped at 20s) and retry the primary once.
+      2. If the retry still fails (or a non-Beeknoee provider hit rate/timeout),
+         fall back to an OpenRouter single-shot invocation when the key is set.
+      3. Any other exception propagates unchanged.
+    """
+    provider = (os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
+
+    try:
+        return _invoke_primary(llm, messages)
+    except Exception as primary_exc:
+        if not _is_rate_or_timeout(primary_exc):
+            raise
+
+        if provider == "beeknoee":
+            wait = _parse_retry_after_seconds(primary_exc, default=10.0)
+            _log.warning(
+                "node %s: Beeknoee 429/timeout, backing off %.1fs before retry (%s)",
+                node_name or "<?>",
+                wait,
+                primary_exc,
+            )
+            time.sleep(wait)
+            try:
+                return _invoke_primary(llm, messages)
+            except Exception as retry_exc:
+                if not _is_rate_or_timeout(retry_exc):
+                    raise
+                primary_exc = retry_exc
+
+        if _openrouter_available():
+            _log.warning(
+                "node %s: primary 429/timeout, falling back to OpenRouter (%s)",
+                node_name or "<?>",
+                primary_exc,
+            )
+            try:
+                return _invoke_openrouter_once(messages)
+            except Exception as fallback_exc:
+                _log.error(
+                    "node %s: OpenRouter fallback also failed: %s",
+                    node_name or "<?>",
+                    fallback_exc,
+                )
+                raise fallback_exc from primary_exc
+
+        raise
 
 
 class TAState(TypedDict, total=False):
@@ -128,24 +277,81 @@ def _retrieve_tech_summary(
     return data.get("tech_context", "") or ""
 
 
+def _light_mode_enabled() -> bool:
+    """Return True when LangGraph should skip the 3 debator nodes.
+
+    Controlled by ``LANGGRAPH_LIGHT_MODE``; when unset we auto-enable for
+    Beeknoee because its per-key rate limit makes the full 10-call pipeline
+    routinely exceed the .NET HttpClient timeout.
+    """
+    raw = (os.getenv("LANGGRAPH_LIGHT_MODE") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    provider = (os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
+    return provider == "beeknoee"
+
+
 def build_ta_graph(*, llm: Any, backend_base_url: str):
     """
     Build a multi-node TA pipeline inspired by TradingAgents.
 
     Note: We keep the final output schema aligned with the UI contract.
     """
+    light_mode = _light_mode_enabled()
+
+    def context_loader_node(state: TAState) -> Dict[str, Any]:
+        """Fetch news + tech contexts in parallel.
+
+        Skips HTTP if the caller already supplied both contexts (backend
+        sometimes pre-fills them). Any per-retriever failure is swallowed so
+        the downstream analyst nodes can still run with an empty context,
+        mirroring the previous per-node try/except behavior.
+        """
+        symbol = state["symbol"]
+        preset_news = (state.get("news_context") or "").strip()
+        preset_tech = (state.get("tech_context") or "").strip()
+
+        if preset_news and preset_tech:
+            return {"news_context": preset_news, "tech_context": preset_tech}
+
+        def _fetch_news() -> str:
+            if preset_news:
+                return preset_news
+            try:
+                return _retrieve_news_context(
+                    backend_base_url=backend_base_url, symbol=symbol, top_k=8, days=7
+                )
+            except Exception as exc:
+                _log.warning("context_loader: news retrieval failed for %s: %s", symbol, exc)
+                return ""
+
+        def _fetch_tech() -> str:
+            if preset_tech:
+                return preset_tech
+            try:
+                return _retrieve_tech_summary(
+                    backend_base_url=backend_base_url,
+                    symbol=symbol,
+                    interval="1h",
+                    limit=48,
+                )
+            except Exception as exc:
+                _log.warning("context_loader: tech retrieval failed for %s: %s", symbol, exc)
+                return ""
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            news_future = pool.submit(_fetch_news)
+            tech_future = pool.submit(_fetch_tech)
+            news_context = news_future.result()
+            tech_context = tech_future.result()
+
+        return {"news_context": news_context, "tech_context": tech_context}
 
     def news_analyst_node(state: TAState) -> Dict[str, Any]:
         symbol = state["symbol"]
-
-        # Tool retrieval (News) — backend filters by ticker symbol
-        news_context: str
-        try:
-            news_context = _retrieve_news_context(
-                backend_base_url=backend_base_url, symbol=symbol, top_k=8, days=7
-            )
-        except Exception:
-            news_context = state.get("news_context", "") or ""
+        news_context = state.get("news_context", "") or ""
 
         # Agent reasoning (text only; JSON produced at RiskJudgeNode)
         system_prompt = (
@@ -159,32 +365,20 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Cuối cùng ghi ngắn gọn: Bull case và Bear case (mỗi dòng 1-2 câu)."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="news_analyst",
             )
             news_agent_text = response.content
         except Exception as e:
             news_agent_text = f"(News Analyst LLM unavailable: {_llm_failure_message(e)})"
         return {
-            "news_context": news_context,
             "news_agent_text": news_agent_text,
         }
 
     def tech_analyst_node(state: TAState) -> Dict[str, Any]:
-        interval = "1h"
-        limit = 48
-
-        # Tool retrieval (Tech)
-        tech_context: str
-        try:
-            tech_context = _retrieve_tech_summary(
-                backend_base_url=backend_base_url,
-                symbol=state["symbol"],
-                interval=interval,
-                limit=limit,
-            )
-        except Exception:
-            tech_context = state.get("tech_context", "") or ""
+        tech_context = state.get("tech_context", "") or ""
 
         system_prompt = (
             f"Bạn là Technical Analyst cổ phiếu (mã {state['symbol']}). "
@@ -197,14 +391,15 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Cuối cùng ghi ngắn gọn: Bull case và Bear case (mỗi dòng 1-2 câu)."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="tech_analyst",
             )
             tech_agent_text = response.content
         except Exception as e:
             tech_agent_text = f"(Tech Analyst LLM unavailable: {_llm_failure_message(e)})"
         return {
-            "tech_context": tech_context,
             "tech_agent_text": tech_agent_text,
         }
 
@@ -221,8 +416,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Trả về chuỗi lập luận bull (2-5 gạch đầu dòng) + 1 kết luận tóm tắt."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="bull_researcher",
             )
             bull_text = response.content
         except Exception as e:
@@ -242,8 +439,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Trả về chuỗi lập luận bear (2-5 gạch đầu dòng) + 1 kết luận tóm tắt."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="bear_researcher",
             )
             bear_text = response.content
         except Exception as e:
@@ -263,8 +462,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Viết 1 đoạn tổng hợp + 3 bullet: điều kiện ủng hộ bull, điều kiện ủng hộ bear, và điểm mơ hồ."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="research_manager",
             )
             manager_text = response.content
         except Exception as e:
@@ -285,8 +486,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "(4) reasoning 3-6 câu."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="trader",
             )
             trader_text = response.content
         except Exception as e:
@@ -307,8 +510,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Trả về 3-6 bullet risk triggers (mỗi bullet nêu trigger + vì sao nguy hiểm)."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="aggressive_debator",
             )
             text = response.content
         except Exception as e:
@@ -328,8 +533,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Trả về 3-6 bullet risk uncertainty (trigger/điều kiện + mức độ tác động)."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="neutral_debator",
             )
             text = response.content
         except Exception as e:
@@ -349,8 +556,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Trả về 2-5 kịch bản xấu (worst-case scenarios) + mỗi kịch bản kèm 1-2 biện pháp theo dõi/giảm thiểu."
         )
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="conservative_debator",
             )
             text = response.content
         except Exception as e:
@@ -367,6 +576,13 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             "Bạn KHÔNG được bịa tin tức hay số liệu ngoài hai khối context đã cho. "
             "Trả về TUYỆT ĐỐI JSON hợp lệ, không markdown, không text rác ngoài JSON."
         )
+        debator_block = ""
+        if not light_mode:
+            debator_block = (
+                f"- aggressive_debator_text:\n{state.get('aggressive_debator_text','')}\n\n"
+                f"- neutral_debator_text:\n{state.get('neutral_debator_text','')}\n\n"
+                f"- conservative_debator_text:\n{state.get('conservative_debator_text','')}\n\n"
+            )
         human_prompt = (
             f"=== NEWS_CONTEXT ===\n{news_context}\n\n"
             f"=== TECH_CONTEXT ===\n{tech_context}\n\n"
@@ -377,9 +593,7 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             f"- bear_arguments_text:\n{state.get('bear_arguments_text','')}\n\n"
             f"- research_manager_text:\n{state.get('research_manager_text','')}\n\n"
             f"- trader_text:\n{state.get('trader_text','')}\n\n"
-            f"- aggressive_debator_text:\n{state.get('aggressive_debator_text','')}\n\n"
-            f"- neutral_debator_text:\n{state.get('neutral_debator_text','')}\n\n"
-            f"- conservative_debator_text:\n{state.get('conservative_debator_text','')}\n\n"
+            f"{debator_block}"
             "Return JSON theo schema sau (bắt buộc đủ các field):\n"
             "{\n"
             '  "forecast": "UP"|"DOWN"|"SIDEWAYS"|"DOWN_SLIGHTLY",\n'
@@ -398,8 +612,10 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
         )
 
         try:
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            response = _invoke_llm(
+                llm,
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)],
+                node_name="risk_judge",
             )
         except Exception as e:
             hint = _llm_failure_message(e)
@@ -465,27 +681,48 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
 
     # Build graph
     workflow = StateGraph(TAState)
+    workflow.add_node("context_loader", context_loader_node)
     workflow.add_node("news_analyst", news_analyst_node)
     workflow.add_node("tech_analyst", tech_analyst_node)
     workflow.add_node("bull_researcher", bull_researcher_node)
     workflow.add_node("bear_researcher", bear_researcher_node)
     workflow.add_node("research_manager", research_manager_node)
     workflow.add_node("trader", trader_node)
-    workflow.add_node("aggressive_debator", aggressive_debator_node)
-    workflow.add_node("neutral_debator", neutral_debator_node)
-    workflow.add_node("conservative_debator", conservative_debator_node)
+    if not light_mode:
+        workflow.add_node("aggressive_debator", aggressive_debator_node)
+        workflow.add_node("neutral_debator", neutral_debator_node)
+        workflow.add_node("conservative_debator", conservative_debator_node)
     workflow.add_node("risk_judge", risk_judge_node)
 
-    workflow.add_edge(START, "news_analyst")
-    workflow.add_edge("news_analyst", "tech_analyst")
-    workflow.add_edge("tech_analyst", "bull_researcher")
+    workflow.add_edge(START, "context_loader")
+    # Beeknoee (and similar gateways) often allow only one in-flight LLM call per key;
+    # parallel news + tech analysts would trigger concurrent_limit_exceeded (429).
+    provider = (os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
+    if provider == "beeknoee":
+        workflow.add_edge("context_loader", "news_analyst")
+        workflow.add_edge("news_analyst", "tech_analyst")
+        workflow.add_edge("tech_analyst", "bull_researcher")
+    else:
+        # Fan-out: news_analyst and tech_analyst run in parallel after contexts are loaded.
+        workflow.add_edge("context_loader", "news_analyst")
+        workflow.add_edge("context_loader", "tech_analyst")
+        # Fan-in: both analysts converge on bull_researcher (state merge is safe because
+        # news_analyst writes news_agent_text and tech_analyst writes tech_agent_text).
+        workflow.add_edge("news_analyst", "bull_researcher")
+        workflow.add_edge("tech_analyst", "bull_researcher")
     workflow.add_edge("bull_researcher", "bear_researcher")
     workflow.add_edge("bear_researcher", "research_manager")
     workflow.add_edge("research_manager", "trader")
-    workflow.add_edge("trader", "aggressive_debator")
-    workflow.add_edge("aggressive_debator", "neutral_debator")
-    workflow.add_edge("neutral_debator", "conservative_debator")
-    workflow.add_edge("conservative_debator", "risk_judge")
+    if light_mode:
+        # Light mode: skip the 3 debator nodes; trader feeds risk_judge directly.
+        # Saves ~3 LLM round-trips, crucial when the upstream provider is rate
+        # limited (Beeknoee) and the .NET HttpClient timeout is finite.
+        workflow.add_edge("trader", "risk_judge")
+    else:
+        workflow.add_edge("trader", "aggressive_debator")
+        workflow.add_edge("aggressive_debator", "neutral_debator")
+        workflow.add_edge("neutral_debator", "conservative_debator")
+        workflow.add_edge("conservative_debator", "risk_judge")
     workflow.add_edge("risk_judge", END)
 
     return workflow.compile()

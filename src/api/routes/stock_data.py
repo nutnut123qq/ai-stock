@@ -2,6 +2,7 @@
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from src.application.services.stock_data_service import StockDataService
@@ -64,7 +65,7 @@ async def get_all_symbols(
     Returns:
         List of stock symbols
     """
-    symbols_data = stock_service.get_all_symbols(exchange)
+    symbols_data = await run_in_threadpool(stock_service.get_all_symbols, exchange)
     symbols = [
         SymbolInfo(
             symbol=s.get('ticker', s.get('symbol', '')),
@@ -94,7 +95,7 @@ async def get_stock_quote(
     Returns:
         Stock quote information
     """
-    quote = stock_service.get_stock_quote(symbol, source)
+    quote = await run_in_threadpool(stock_service.get_stock_quote, symbol, source)
     return quote
 
 
@@ -115,7 +116,7 @@ async def get_multiple_quotes(
     Returns:
         List of stock quotes
     """
-    quotes = stock_service.get_multiple_quotes(symbols, source)
+    quotes = await run_in_threadpool(stock_service.get_multiple_quotes, symbols, source)
     return quotes
 
 
@@ -150,7 +151,14 @@ async def get_historical_data(
     if not end_date:
         end_date = datetime.now().strftime('%Y-%m-%d')
     
-    data = stock_service.get_historical_data(symbol, start_date, end_date, interval, source)
+    data = await run_in_threadpool(
+        stock_service.get_historical_data,
+        symbol,
+        start_date,
+        end_date,
+        interval,
+        source,
+    )
     return data
 
 
@@ -176,5 +184,5 @@ async def get_vn30_quotes(
         'MWG', 'HDB', 'ACB', 'TPB', 'STB', 'PDR', 'VIB', 'BCM', 'KDH', 'NVL'
     ]
     
-    quotes = stock_service.get_multiple_quotes(vn30_symbols, source)
+    quotes = await run_in_threadpool(stock_service.get_multiple_quotes, vn30_symbols, source)
     return quotes

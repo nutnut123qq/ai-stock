@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     openrouter_model: str = Field(default="openrouter/free", env="OPENROUTER_MODEL")
     openrouter_http_referer: Optional[str] = Field(default=None, env="OPENROUTER_HTTP_REFERER")
     openrouter_app_title: Optional[str] = Field(default=None, env="OPENROUTER_APP_TITLE")
+    beeknoee_api_key: Optional[str] = Field(default=None, env="BEEKNOEE_API_KEY")
+    beeknoee_base_url: str = Field(
+        default="https://platform.beeknoee.com/api/v1",
+        env="BEEKNOEE_BASE_URL",
+    )
+    beeknoee_model: str = Field(default="glm-4.7-flash", env="BEEKNOEE_MODEL")
     api_title: str = Field(default="Stock Investment AI Service", env="API_TITLE")
     api_version: str = Field(default="1.0.0", env="API_VERSION")
     
@@ -76,7 +82,20 @@ class Settings(BaseSettings):
         default=None,
         env="INTERNAL_API_KEY"
     )
-    
+
+    # Redis cache configuration (shared infra with .NET backend — use a different DB index to avoid key collisions)
+    redis_host: str = Field(default="localhost", env="REDIS_HOST")
+    redis_port: int = Field(default=6379, env="REDIS_PORT")
+    redis_db: int = Field(default=1, env="REDIS_DB")
+    redis_password: Optional[str] = Field(default=None, env="REDIS_PASSWORD")
+    redis_socket_timeout: float = Field(default=2.0, env="REDIS_SOCKET_TIMEOUT")
+
+    # VNStock caching knobs (fail-open when Redis unreachable)
+    vnstock_cache_enabled: bool = Field(default=True, env="VNSTOCK_CACHE_ENABLED")
+    vnstock_cache_quote_ttl: int = Field(default=45, env="VNSTOCK_CACHE_QUOTE_TTL")
+    vnstock_cache_history_ttl: int = Field(default=21600, env="VNSTOCK_CACHE_HISTORY_TTL")
+    vnstock_cache_symbols_ttl: int = Field(default=86400, env="VNSTOCK_CACHE_SYMBOLS_TTL")
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

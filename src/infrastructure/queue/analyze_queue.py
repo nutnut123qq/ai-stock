@@ -1,0 +1,131 @@
+"""RQ-backed job queue for LangGraph /api/analyze.
+
+Two public pieces:
+
+* :func:`get_analyze_queue` — returns the shared ``rq.Queue`` that the FastAPI
+  endpoint enqueues to and that the worker process consumes from.
+* :func:`run_analyze_job` — the actual work function executed by the worker.
+  It forces ``LLM_PROVIDER=openrouter`` (so the forecast pool is fully
+  separated from Beeknoee used by AI Insights) and runs the LangGraph
+  pipeline, returning a JSON-serialisable dict that RQ stores in Redis.
+
+The queue/result Redis connection reuses ``Settings.redis_*`` so the
+existing cache/VNStock infra already validated the credentials.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict, Optional
+
+import redis
+
+from src.shared.config import get_settings
+
+_log = logging.getLogger(__name__)
+
+ANALYZE_QUEUE_NAME = "analyze"
+
+_redis_conn: Optional[redis.Redis] = None
+_queue: Optional[Any] = None
+
+
+def get_redis_connection() -> redis.Redis:
+    """Return a shared redis-py client for RQ (separate from the cache helper).
+
+    RQ needs ``decode_responses=False`` because it stores pickled Python
+    objects as binary blobs. We build a dedicated connection with the same
+    host/port/db/password as the rest of the app.
+    """
+    global _redis_conn
+    if _redis_conn is not None:
+        return _redis_conn
+
+    settings = get_settings()
+    # ``socket_timeout=None`` so RQ can set a long timeout for blocking
+    # dequeue; a short timeout makes ``redis-py`` raise while the worker idles.
+    connect_timeout = max(settings.redis_socket_timeout, 5.0)
+    _redis_conn = redis.Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        db=settings.redis_db,
+        password=settings.redis_password or None,
+        socket_timeout=None,
+        socket_connect_timeout=connect_timeout,
+        health_check_interval=30,
+    )
+    return _redis_conn
+
+
+def get_analyze_queue() -> Any:
+    """Return the shared RQ queue (lazy singleton).
+
+    Importing ``rq`` is deferred so the module is cheap to import in tests
+    that never touch the queue.
+    """
+    global _queue
+    if _queue is not None:
+        return _queue
+
+    from rq import Queue
+
+    conn = get_redis_connection()
+    _queue = Queue(ANALYZE_QUEUE_NAME, connection=conn)
+    return _queue
+
+
+def run_analyze_job(
+    symbol: str,
+    news_context: str = "",
+    tech_context: str = "",
+) -> Dict[str, Any]:
+    """Execute one LangGraph analyse run — called by the RQ worker.
+
+    Forecasts run on OpenRouter exclusively to free the Beeknoee slot for
+    AI insights. We override the env var *inside the worker process* so
+    the change cannot leak back into the FastAPI request handlers.
+    """
+    forecast_provider = (
+        os.getenv("ANALYZE_LLM_PROVIDER") or "openrouter"
+    ).strip().lower()
+
+    prev_provider = os.environ.get("LLM_PROVIDER")
+    os.environ["LLM_PROVIDER"] = forecast_provider
+
+    # Heavier analyse can keep the full debator set; disable light mode
+    # unless the operator explicitly opts in.
+    prev_light = os.environ.get("LANGGRAPH_LIGHT_MODE")
+    if os.getenv("ANALYZE_LIGHT_MODE") is not None:
+        os.environ["LANGGRAPH_LIGHT_MODE"] = os.environ["ANALYZE_LIGHT_MODE"]
+
+    try:
+        # Imported lazily so the worker does not pull heavy deps at startup
+        # when the queue is empty.
+        from src.api.langgraph_analyze import _build_llm
+        from src.langgraph_stock.graph import build_ta_graph
+
+        llm = _build_llm()
+        backend_base_url = os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
+        graph = build_ta_graph(llm=llm, backend_base_url=backend_base_url)
+
+        state = {
+            "symbol": symbol,
+            "news_context": news_context or "",
+            "tech_context": tech_context or "",
+        }
+
+        _log.info(
+            "run_analyze_job: start symbol=%s provider=%s", symbol, forecast_provider
+        )
+        result = graph.invoke(state)
+        _log.info("run_analyze_job: done symbol=%s", symbol)
+        return result
+    finally:
+        if prev_provider is None:
+            os.environ.pop("LLM_PROVIDER", None)
+        else:
+            os.environ["LLM_PROVIDER"] = prev_provider
+        if prev_light is None:
+            os.environ.pop("LANGGRAPH_LIGHT_MODE", None)
+        else:
+            os.environ["LANGGRAPH_LIGHT_MODE"] = prev_light

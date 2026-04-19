@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from src.api import langgraph_analyze
-from src.api.routes import summarize, analyze, forecast, qa, alert_nlp, stock_data, insights, answer_context, rag
+from src.api.routes import summarize, forecast, qa, stock_data, insights, rag
 from src.shared.config import get_settings
 from src.shared.exceptions import (
     AIServiceException,
@@ -43,12 +43,21 @@ async def add_request_metadata(request: Request, call_next):
     start_time = time.time()
     request_id = str(uuid.uuid4())
     set_request_id(request_id)
-    
+
+    logger.info(
+        "Request started",
+        extra={
+            "request_id": request_id,
+            "route": request.url.path,
+            "method": request.method,
+        }
+    )
+
     response = await call_next(request)
-    
+
     # Calculate latency
     latency_ms = (time.time() - start_time) * 1000
-    
+
     # Log structured request metadata
     logger.info(
         "Request completed",
@@ -60,7 +69,7 @@ async def add_request_metadata(request: Request, call_next):
             "latency_ms": round(latency_ms, 2)
         }
     )
-    
+
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -213,13 +222,10 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Include routers
 app.include_router(langgraph_analyze.router, prefix="/api", tags=["langgraph"])
 app.include_router(summarize.router, prefix="/api", tags=["summarize"])
-app.include_router(analyze.router, prefix="/api", tags=["analyze"])
 app.include_router(forecast.router, prefix="/api/forecast", tags=["forecast"])  # P0 Fix: Correct prefix for forecast
 app.include_router(qa.router, prefix="/api", tags=["qa"])
-app.include_router(alert_nlp.router, prefix="/api", tags=["alert-nlp"])
 app.include_router(stock_data.router, tags=["stock"])
 app.include_router(insights.router, prefix="/api/insights", tags=["insights"])  # P0 Fix: Correct prefix for insights
-app.include_router(answer_context.router, prefix="/api/ai", tags=["answer"]) # V1 Analysis Reports Q&A
 app.include_router(rag.router, prefix="/api", tags=["rag"]) # RAG ingestion
 
 
@@ -231,5 +237,29 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": settings.api_title}
+    """Health check endpoint.
+
+    Always returns HTTP 200 (fail-open): Redis outages must not take the AI
+    service offline because ``StockDataService`` degrades gracefully without
+    cache. The ``redis`` field surfaces the current status so operators can
+    still detect a cache miss-storm scenario.
+    """
+    from src.api.dependencies import get_cache_service
+
+    redis_status = "disabled"
+    if settings.vnstock_cache_enabled:
+        cache = get_cache_service()
+        if cache is None:
+            redis_status = "down"
+        else:
+            try:
+                redis_status = "ok" if cache.healthcheck() else "down"
+            except Exception:  # noqa: BLE001 — health must never raise
+                redis_status = "down"
+
+    return {
+        "status": "healthy",
+        "service": settings.api_title,
+        "redis": redis_status,
+        "vnstock_cache_enabled": settings.vnstock_cache_enabled,
+    }
