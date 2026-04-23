@@ -16,4 +16,4 @@ class EmbeddingProvider(ABC):
         Returns:
             Embedding vector as list of floats
         """
-        pass
+        raise NotImplementedError("Subclass must implement generate_embedding()")

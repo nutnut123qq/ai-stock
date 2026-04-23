@@ -1,5 +1,6 @@
 """RAG (Retrieval-Augmented Generation) API routes."""
 import os
+import secrets
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, Optional
@@ -71,10 +72,13 @@ def validate_api_key(x_internal_api_key: Optional[str] = Header(None)):
     settings = get_settings()
     expected_key = getattr(settings, "internal_api_key", None) or os.getenv("INTERNAL_API_KEY")
     
-    # Validate
+    # Validate: fail-closed — require key to be configured
     if not expected_key:
-        logger.warning("INTERNAL_API_KEY not configured; skipping validation")
-        return True
+        logger.error("INTERNAL_API_KEY not configured; rejecting request")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="RAG authentication not configured"
+        )
     
     if not x_internal_api_key:
         logger.warning("RAG ingest request missing X-Internal-Api-Key header")
@@ -83,7 +87,8 @@ def validate_api_key(x_internal_api_key: Optional[str] = Header(None)):
             detail="Missing X-Internal-Api-Key header"
         )
     
-    if x_internal_api_key != expected_key:
+    # Timing-attack resistant comparison
+    if not secrets.compare_digest(x_internal_api_key, expected_key):
         logger.warning("RAG ingest request with invalid X-Internal-Api-Key")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -149,7 +154,7 @@ async def ingest_document(
         logger.error(f"Error ingesting document {request.document_id}: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to ingest document: {str(e)}"
+            detail="Failed to ingest document"
         )
 
 
@@ -171,5 +176,5 @@ async def delete_document(
         logger.error(f"Error deleting document {document_id}: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete document: {str(e)}"
+            detail="Failed to delete document"
         )

@@ -3,7 +3,7 @@ from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 from src.application.services.stock_data_service import StockDataService
 from src.api.dependencies import get_stock_data_service
@@ -48,6 +48,11 @@ class HistoricalDataPoint(BaseModel):
 class SymbolsResponse(BaseModel):
     """Response model for symbols list."""
     symbols: List[SymbolInfo]
+
+
+class MultipleQuotesRequest(BaseModel):
+    """Request model for multiple stock quotes."""
+    symbols: List[str] = Field(..., min_items=1, max_items=50, description="Danh sách mã chứng khoán (tối đa 50)")
 
 
 @router.get("/symbols", response_model=SymbolsResponse)
@@ -101,7 +106,7 @@ async def get_stock_quote(
 
 @router.post("/quotes", response_model=List[StockQuoteResponse])
 async def get_multiple_quotes(
-    symbols: Annotated[List[str], Body(..., description="Danh sách mã chứng khoán")],
+    request: MultipleQuotesRequest,
     source: str = Query("KBS", description="Nguồn dữ liệu: KBS, VCI"),
     stock_service: StockDataService = Depends(get_stock_data_service)
 ):
@@ -109,14 +114,14 @@ async def get_multiple_quotes(
     Lấy giá của nhiều mã chứng khoán cùng lúc.
 
     Args:
-        symbols: List of stock symbols
+        request: Request containing list of stock symbols (max 50)
         source: Data source
         stock_service: Stock data service instance
 
     Returns:
         List of stock quotes
     """
-    quotes = await run_in_threadpool(stock_service.get_multiple_quotes, symbols, source)
+    quotes = await run_in_threadpool(stock_service.get_multiple_quotes, request.symbols, source)
     return quotes
 
 

@@ -23,33 +23,78 @@ from src.shared.config import get_settings
 logger = get_logger(__name__)
 
 
+class LLMProviderSelector:
+    """Centralized LLM provider selection logic."""
+
+    def __init__(self, settings):
+        self.settings = settings
+
+    def select_provider(self, force_provider: Optional[str] = None) -> LLMProvider:
+        """Select LLM provider based on configured priority.
+
+        Args:
+            force_provider: Force a specific provider (e.g. 'openrouter' for forecasts)
+
+        Returns:
+            LLMProvider instance
+
+        Raises:
+            ConfigurationError: If no providers are configured.
+        """
+        # Define priority order: name, config_check, factory
+        priority_order = [
+            ("beeknoee", self.settings.beeknoee_api_key, self._create_beeknoee),
+            ("gemini", self.settings.gemini_api_key, self._create_gemini),
+            ("openrouter", self.settings.openrouter_api_key, self._create_openrouter),
+            ("blackbox", True, self._create_blackbox),  # Fallback
+        ]
+
+        if force_provider:
+            for name, _, factory in priority_order:
+                if name == force_provider:
+                    logger.info("Using forced LLM provider: %s", force_provider)
+                    return factory()
+            logger.warning(
+                "Forced provider %s not configured; using default priority",
+                force_provider,
+            )
+
+        for name, key_configured, factory in priority_order:
+            if key_configured:
+                logger.info("Using %s as LLM provider", name)
+                return factory()
+
+        from src.shared.exceptions import ConfigurationError
+
+        raise ConfigurationError("No LLM providers are configured")
+
+    def _create_beeknoee(self) -> LLMProvider:
+        from src.infrastructure.llm.beeknoee_client import BeeknoeeClient
+
+        return BeeknoeeClient(model_name=self.settings.beeknoee_model)
+
+    def _create_gemini(self) -> LLMProvider:
+        return GeminiClient()
+
+    def _create_openrouter(self) -> LLMProvider:
+        from src.infrastructure.llm.openrouter_client import OpenRouterClient
+
+        return OpenRouterClient(model_name=self.settings.openrouter_model)
+
+    def _create_blackbox(self) -> LLMProvider:
+        from src.infrastructure.llm.blackbox_client import BlackboxClient
+
+        return BlackboxClient(model_name=self.settings.blackbox_model)
+
+
 # Infrastructure dependencies (singletons)
 @lru_cache()
 def get_llm_provider() -> LLMProvider:
-    """Get LLM provider singleton. Uses Gemini if GEMINI_API_KEY is set, otherwise falls back to Blackbox."""
+    """Get LLM provider singleton using centralized selector."""
     logger.debug("Creating LLM provider instance")
     settings = get_settings()
-
-    if settings.beeknoee_api_key:
-        from src.infrastructure.llm.beeknoee_client import BeeknoeeClient
-
-        logger.info("Using Beeknoee as LLM provider")
-        return BeeknoeeClient(model_name=settings.beeknoee_model)
-
-    # Prefer Gemini if API key is available
-    if settings.gemini_api_key:
-        logger.info("Using Gemini as LLM provider")
-        return GeminiClient()
-    if settings.openrouter_api_key:
-        from src.infrastructure.llm.openrouter_client import OpenRouterClient
-
-        logger.info("Using OpenRouter as LLM provider")
-        return OpenRouterClient(model_name=settings.openrouter_model)
-    # Fallback to Blackbox (will raise error if key not set)
-    from src.infrastructure.llm.blackbox_client import BlackboxClient
-
-    logger.info("Using Blackbox as LLM provider")
-    return BlackboxClient(model_name=settings.blackbox_model)
+    selector = LLMProviderSelector(settings)
+    return selector.select_provider()
 
 
 @lru_cache()
@@ -62,13 +107,8 @@ def get_forecast_llm_provider() -> LLMProvider:
     back to the global provider otherwise so Beeknoee/Gemini/Blackbox still work.
     """
     settings = get_settings()
-    if settings.openrouter_api_key:
-        from src.infrastructure.llm.openrouter_client import OpenRouterClient
-
-        logger.info("Using OpenRouter as forecast LLM provider")
-        return OpenRouterClient(model_name=settings.openrouter_model)
-    logger.info("OPENROUTER_API_KEY not set — forecast falls back to default provider")
-    return get_llm_provider()
+    selector = LLMProviderSelector(settings)
+    return selector.select_provider(force_provider="openrouter")
 
 
 @lru_cache()

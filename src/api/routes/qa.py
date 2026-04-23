@@ -69,9 +69,16 @@ async def answer_question(
             symbol=request.symbol
         )
     except Exception as exc:
+        from src.shared.logging import get_logger
+        logger = get_logger(__name__)
+        logger.error(
+            "QA service error",
+            exc_info=True,
+            extra={"error_type": type(exc).__name__}
+        )
         raise HTTPException(
             status_code=503,
-            detail=f"QA/LLM failed: {exc!s}",
+            detail="QA service temporarily unavailable. Please try again later.",
         ) from exc
     
     # Convert sources to SourceObjectModel objects

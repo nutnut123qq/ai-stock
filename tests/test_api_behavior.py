@@ -104,7 +104,7 @@ class AiRouteBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await answer_question(request, qa_service=QaServiceStub())
 
         self.assertEqual(ctx.exception.status_code, 503)
-        self.assertIn("QA/LLM failed", str(ctx.exception.detail))
+        self.assertIn("temporarily unavailable", str(ctx.exception.detail))
 
     async def test_qa_route_maps_sources_response(self) -> None:
         class QaServiceStub:

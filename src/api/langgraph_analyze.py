@@ -352,9 +352,10 @@ async def analyze_stock(request: AnalyzeRequest):
     except HTTPException:
         raise
     except Exception as e:
+        _log.error("TA graph analysis failed", exc_info=True, extra={"error_type": type(e).__name__})
         raise HTTPException(
             status_code=500,
-            detail=f"TA graph analysis failed: {e!s}",
+            detail="Analysis service temporarily unavailable. Please try again later.",
         ) from e
 
 
@@ -423,7 +424,7 @@ async def enqueue_analyze(request: AnalyzeRequest):
         _log.exception("enqueue_analyze failed for %s", symbol)
         raise HTTPException(
             status_code=503,
-            detail=f"Analyze queue unavailable: {exc!s}",
+            detail="Analyze queue temporarily unavailable. Please try again later.",
         ) from exc
 
     _log.info("enqueue_analyze: symbol=%s jobId=%s", symbol, job.id)
@@ -461,7 +462,7 @@ async def get_analyze_job(job_id: str):
         _log.exception("get_analyze_job: queue unavailable")
         raise HTTPException(
             status_code=503,
-            detail=f"Analyze queue unavailable: {exc!s}",
+            detail="Analyze queue temporarily unavailable. Please try again later.",
         ) from exc
 
     try:
@@ -472,7 +473,7 @@ async def get_analyze_job(job_id: str):
         _log.exception("get_analyze_job: fetch failed for %s", job_id)
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot fetch job {job_id}: {exc!s}",
+            detail="Cannot fetch job status. Please try again later.",
         ) from exc
 
     status = _map_rq_status(job.get_status(refresh=True))

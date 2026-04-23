@@ -21,16 +21,17 @@ class VectorStore(ABC):
         Returns:
             List of result dictionaries with metadata
         """
-        pass
+        raise NotImplementedError("Subclass must implement search()")
 
     @abstractmethod
     async def upsert(self, vectors: List[Dict]):
-        pass
+        """Upsert vectors into the collection."""
+        raise NotImplementedError("Subclass must implement upsert()")
 
     @abstractmethod
     async def ensure_collection(self, vector_size: Optional[int] = None) -> None:
         """Ensure the vector collection exists with correct params."""
-        pass
+        raise NotImplementedError("Subclass must implement ensure_collection()")
 
     @abstractmethod
     async def upsert_chunks(
@@ -41,10 +42,10 @@ class VectorStore(ABC):
         vectors: List[List[float]]
     ) -> None:
         """Upsert chunk payloads + vectors into the collection."""
-        pass
+        raise NotImplementedError("Subclass must implement upsert_chunks()")
 
     @abstractmethod
     async def delete_document(self, document_id: str) -> int:
         """Delete all points for a document, returning deleted count."""
-        pass
+        raise NotImplementedError("Subclass must implement delete_document()")
 

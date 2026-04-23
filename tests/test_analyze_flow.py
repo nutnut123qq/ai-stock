@@ -13,6 +13,7 @@ patch module-level seams exposed in ``src.api.langgraph_analyze`` and
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 import types
@@ -130,8 +131,10 @@ class HealthProbeFallbackTests(unittest.TestCase):
         def _fail_build_graph(*args, **kwargs):  # pragma: no cover
             raise AssertionError("graph must not be built when probe fails")
 
-        with patch.object(api_mod, "_build_llm", return_value=_FailingLLM()), \
+        with patch.dict(os.environ, {"LLM_PROVIDER": "ollama", "BEEKNOEE_SKIP_LLM_PROBE": ""}, clear=False), \
+             patch.object(api_mod, "_build_llm", return_value=_FailingLLM()), \
              patch.object(api_mod, "_get_analyze_cache", return_value=None), \
+             patch.object(api_mod, "_llm_health_probe", return_value=(False, "probe failed")), \
              patch.object(api_mod, "build_ta_graph", _fail_build_graph):
             payload = asyncio.run(analyze_stock(AnalyzeRequest(symbol="VIC")))
 
@@ -194,8 +197,10 @@ class AnalyzeCacheTests(unittest.TestCase):
         api_mod._analyze_cache = None
 
         # First call: probe fails → fallback returned, cache must stay empty.
-        with patch.object(api_mod, "_build_llm", return_value=_FailingLLM()), \
-             patch.object(api_mod, "_get_analyze_cache", return_value=cache):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "ollama", "BEEKNOEE_SKIP_LLM_PROBE": ""}, clear=False), \
+             patch.object(api_mod, "_build_llm", return_value=_FailingLLM()), \
+             patch.object(api_mod, "_get_analyze_cache", return_value=cache), \
+             patch.object(api_mod, "_llm_health_probe", return_value=(False, "probe failed")):
             payload = asyncio.run(analyze_stock(AnalyzeRequest(symbol="VIC")))
         self.assertEqual(payload["forecast"], "SIDEWAYS")
 

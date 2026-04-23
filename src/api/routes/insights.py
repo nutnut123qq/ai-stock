@@ -37,7 +37,7 @@ class InsightResponse(BaseModel):
 
 class BatchInsightRequest(BaseModel):
     """Request model for batch insight generation."""
-    symbols: List[str]
+    symbols: List[str] = Field(..., min_items=1, max_items=20, description="Danh sách mã chứng khoán (tối đa 20)")
     technical_data: Optional[dict] = None  # Same for all symbols
     fundamental_data: Optional[dict] = None
     sentiment_data: Optional[dict] = None

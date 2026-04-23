@@ -21,5 +21,5 @@ class LLMProvider(ABC):
         Returns:
             Generated text content
         """
-        pass
+        raise NotImplementedError("Subclass must implement generate()")
 
