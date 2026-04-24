@@ -407,7 +407,7 @@ async def enqueue_analyze(request: AnalyzeRequest):
         )
 
         queue = get_analyze_queue()
-        job_timeout = int(os.getenv("ANALYZE_JOB_TIMEOUT", "420") or 420)
+        job_timeout = int(os.getenv("ANALYZE_JOB_TIMEOUT", "600") or 600)
         result_ttl = int(os.getenv("ANALYZE_JOB_RESULT_TTL", str(8 * 3600)) or (8 * 3600))
         failure_ttl = int(os.getenv("ANALYZE_JOB_FAILURE_TTL", "3600") or 3600)
 

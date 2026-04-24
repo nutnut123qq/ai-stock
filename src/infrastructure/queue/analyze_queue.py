@@ -114,11 +114,18 @@ def run_analyze_job(
             "tech_context": tech_context or "",
         }
 
+        import time
+        start_ts = time.time()
         _log.info(
-            "run_analyze_job: start symbol=%s provider=%s", symbol, forecast_provider
+            "run_analyze_job: start symbol=%s provider=%s backend=%s light=%s",
+            symbol,
+            forecast_provider,
+            backend_base_url,
+            os.environ.get("LANGGRAPH_LIGHT_MODE", "auto"),
         )
         result = graph.invoke(state)
-        _log.info("run_analyze_job: done symbol=%s", symbol)
+        elapsed = time.time() - start_ts
+        _log.info("run_analyze_job: done symbol=%s elapsed=%.1fs", symbol, elapsed)
         return result
     finally:
         if prev_provider is None:
