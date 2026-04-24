@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from src.api import langgraph_analyze
-from src.api.routes import summarize, forecast, qa, stock_data, insights, rag
+from src.api.routes import summarize, forecast, qa, stock_data, insights, rag, financial_yf
 from src.shared.config import get_settings
 from src.shared.exceptions import (
     AIServiceException,
@@ -227,6 +227,7 @@ app.include_router(qa.router, prefix="/api", tags=["qa"])
 app.include_router(stock_data.router, tags=["stock"])
 app.include_router(insights.router, prefix="/api/insights", tags=["insights"])  # P0 Fix: Correct prefix for insights
 app.include_router(rag.router, prefix="/api", tags=["rag"]) # RAG ingestion
+app.include_router(financial_yf.router, tags=["financial"])
 
 
 @app.get("/")
