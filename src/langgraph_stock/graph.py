@@ -320,9 +320,11 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             if preset_news:
                 return preset_news
             try:
-                return _retrieve_news_context(
+                ctx = _retrieve_news_context(
                     backend_base_url=backend_base_url, symbol=symbol, top_k=8, days=7
                 )
+                _log.info("context_loader: news for %s length=%d", symbol, len(ctx))
+                return ctx
             except Exception as exc:
                 _log.warning("context_loader: news retrieval failed for %s: %s", symbol, exc)
                 return ""
@@ -331,12 +333,14 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             if preset_tech:
                 return preset_tech
             try:
-                return _retrieve_tech_summary(
+                ctx = _retrieve_tech_summary(
                     backend_base_url=backend_base_url,
                     symbol=symbol,
                     interval="1h",
                     limit=48,
                 )
+                _log.info("context_loader: tech for %s length=%d", symbol, len(ctx))
+                return ctx
             except Exception as exc:
                 _log.warning("context_loader: tech retrieval failed for %s: %s", symbol, exc)
                 return ""
