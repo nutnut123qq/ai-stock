@@ -42,3 +42,8 @@ vnstock-cli-installer.run
 # OS files
 .DS_Store
 Thumbs.db
+
+# AI test output artifacts
+test_results/
+*.db
+*.sqlite

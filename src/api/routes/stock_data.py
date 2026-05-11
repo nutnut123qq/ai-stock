@@ -184,9 +184,9 @@ async def get_vn30_quotes(
     """
     # Danh sách mã VN30 (có thể cập nhật định kỳ)
     vn30_symbols = [
-        'VIC', 'VNM', 'VCB', 'VRE', 'VHM', 'GAS', 'MSN', 'BID', 'CTG', 'HPG',
-        'TCB', 'MBB', 'VPB', 'PLX', 'SAB', 'VJC', 'GVR', 'FPT', 'POW', 'SSI',
-        'MWG', 'HDB', 'ACB', 'TPB', 'STB', 'PDR', 'VIB', 'BCM', 'KDH', 'NVL'
+        'ACB', 'BID', 'CTG', 'DGC', 'FPT', 'GAS', 'GVR', 'HDB', 'HPG', 'LPB',
+        'MBB', 'MSN', 'MWG', 'PLX', 'SAB', 'SHB', 'SSB', 'SSI', 'STB', 'TCB',
+        'TPB', 'VCB', 'VHM', 'VIB', 'VIC', 'VJC', 'VNM', 'VPB', 'VPL', 'VRE'
     ]
     
     quotes = await run_in_threadpool(stock_service.get_multiple_quotes, vn30_symbols, source)
