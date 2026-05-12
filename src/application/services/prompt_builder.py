@@ -160,15 +160,21 @@ Quy tắc bắt buộc:
    type,title,description,confidence,reasoning,target_price,stop_loss,evidence,metadata
 3) type chỉ được là Buy | Sell | Hold.
 4) confidence là số nguyên 0-100.
-5) reasoning phải có 3-5 ý, ngắn gọn, bám dữ liệu.
-6) evidence phải có ít nhất 3 bằng chứng có số liệu cụ thể (RSI/MACD/volume/sentiment...).
-7) Tính nhất quán:
+5) reasoning phải có 3-5 ý, ngắn gọn, bám dữ liệu. Phải có ít nhất 1 ý về cơ bản/tin tức nếu dữ liệu có sẵn.
+6) evidence phải có ít nhất 3 bằng chứng có số liệu cụ thể (RSI/MACD/volume/sentiment/ROE/EPS...).
+7) Framework quyết định (ƯU TIÊN ÁP DỤNG):
+   - Nếu RSI 55-70 + MACD dương + Volume >= TB + (ROE > 12% hoặc EPS tăng hoặc tin tức tích cực)
+     → Buy (không được Hold)
+   - Nếu RSI 30-45 + MACD âm + Volume <= TB + (ROE giảm hoặc tin tiêu cực)
+     → Sell (không được Hold)
+   - Chỉ Hold khi các chỉ báo mâu thuẫn hoặc thiếu dữ liệu nghiêm trọng.
+8) Tính nhất quán:
    - Nếu tín hiệu mâu thuẫn, giảm confidence.
    - Buy thường có target_price >= giá hiện tại và stop_loss <= giá hiện tại.
    - Sell thường có stop_loss >= giá hiện tại nếu là mức vô hiệu hóa luận điểm giảm.
-8) metadata phải chứa:
+9) metadata phải chứa:
    prompt_version, model_hint, validation_notes, market, generated_timezone
-9) Nếu dữ liệu thiếu nhiều, ưu tiên Hold và nêu rõ hạn chế trong reasoning/metadata.
+10) Nếu dữ liệu thiếu nhiều, ưu tiên Hold và nêu rõ hạn chế trong reasoning/metadata.
 """
 
     @staticmethod
