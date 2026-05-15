@@ -17,6 +17,8 @@ import asyncio
 import json
 import os
 import sys
+import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,6 +50,9 @@ VN30_SYMBOLS = [
     "MBB", "MSN", "MWG", "PLX", "SAB", "SHB", "SSB", "SSI", "STB", "TCB",
     "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VPL", "VRE"
 ]
+
+# OpenRouter free tier limit: 20 req/min. Use 18 as safe margin.
+OPENROUTER_RPM_LIMIT = 18
 
 # ---------------------------------------------------------------------------
 # Data fetching helpers (vnstock v3)
@@ -177,6 +182,135 @@ def build_technical_data(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _to_float(val) -> Optional[float]:
+    """Safely convert a value to float, treating NaN/inf as None."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if pd.isna(f) or np.isinf(f):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_fundamental_data(symbol: str) -> Dict[str, Any]:
+    """Fetch quarterly fundamental data using vnstock_data (VCI source)."""
+    try:
+        from vnstock_data import Finance
+        fin = Finance(symbol=symbol.upper(), source="VCI")
+
+        # Income statement (quarterly)
+        income = fin.income_statement(period="quarter", lang="vi")
+        if income is None or income.empty:
+            return {}
+
+        latest = income.iloc[-1]
+        prev = income.iloc[-2] if len(income) > 1 else None
+
+        revenue = _to_float(latest.get("Doanh thu thuần"))
+        revenue_prev = _to_float(prev.get("Doanh thu thuần")) if prev is not None else None
+        revenue_growth = None
+        if revenue and revenue_prev and revenue_prev != 0:
+            revenue_growth = round(((revenue - revenue_prev) / revenue_prev) * 100, 2)
+
+        eps = _to_float(latest.get("Lãi cơ bản trên cổ phiếu (VND)"))
+        net_profit = _to_float(latest.get("Lợi nhuận của Cổ đông của Công ty mẹ"))
+
+        # Ratio report (quarterly)
+        roe = None
+        roa = None
+        pe = None
+        profit_margin = None
+        try:
+            ratio = fin.ratio(period="quarter", lang="vi")
+            if ratio is not None and not ratio.empty:
+                ratio_latest = ratio.iloc[-1]
+                roe = _to_float(ratio_latest.get("ROE (%)"))
+                roa = _to_float(ratio_latest.get("ROA (%)"))
+                pe = _to_float(ratio_latest.get("P/E"))
+                profit_margin = _to_float(ratio_latest.get("Biên LN sau thuế (%)"))
+        except Exception:
+            pass
+
+        # Fallback ROE/ROA if ratio missing but we have net_profit + balance sheet
+        if roe is None or roa is None:
+            try:
+                balance = fin.balance_sheet(period="quarter", lang="vi")
+                if balance is not None and not balance.empty:
+                    bal_latest = balance.iloc[-1]
+                    equity = _to_float(bal_latest.get("Vốn chủ sở hữu"))
+                    total_assets = _to_float(bal_latest.get("Tổng cộng tài sản"))
+                    if roe is None and net_profit and equity and equity != 0:
+                        roe = round((net_profit / equity) * 100, 4)
+                    if roa is None and net_profit and total_assets and total_assets != 0:
+                        roa = round((net_profit / total_assets) * 100, 4)
+            except Exception:
+                pass
+
+        result: Dict[str, Any] = {}
+        if roe is not None:
+            result["roe"] = roe
+        if roa is not None:
+            result["roa"] = roa
+        if eps is not None:
+            result["eps"] = eps
+        if pe is not None:
+            result["pe"] = pe
+        if revenue_growth is not None:
+            result["revenue_growth"] = revenue_growth
+        if profit_margin is not None:
+            result["profit_margin"] = profit_margin
+        return result
+    except Exception as exc:
+        logger.warning(f"Failed to fetch fundamental data for {symbol}: {exc}")
+        return {}
+
+
+def fetch_sentiment_data(symbol: str) -> Dict[str, Any]:
+    """Fetch recent news from vnstock KBS and compute a simple keyword sentiment."""
+    try:
+        from vnstock import Vnstock
+        stock = Vnstock().stock(symbol=symbol, source="KBS")
+        news = stock.company.news()
+        if news is None or news.empty:
+            return {
+                "score": 0.0,
+                "sentiment": "Trung lập",
+                "recent_news": "Không có tin tức",
+            }
+
+        recent = news.head(3)
+        titles = [str(t).strip() for t in recent["title"].tolist() if t and str(t).strip()]
+        news_text = " | ".join(titles)
+
+        # Simple Vietnamese keyword-based sentiment
+        positive = ["tăng", "lợi nhuận", "cao", "vượt", "kỷ lục", "thưởng", "mua", "đầu tư",
+                    "phát triển", "mở rộng", "tích cực", "tăng trưởng", "bùng nổ", "thuận lợi"]
+        negative = ["giảm", "lỗ", "phạt", "thấp", "cắt giảm", "bán", "rút", "phá sản",
+                    "kiện", "vi phạm", "tiêu cực", "suy yếu", "khó khăn", "thua lỗ"]
+        text_lower = news_text.lower()
+        p_count = sum(1 for w in positive if w in text_lower)
+        n_count = sum(1 for w in negative if w in text_lower)
+        score = (p_count - n_count) / max(len(titles), 1)
+        score = max(-1.0, min(1.0, score))
+
+        sentiment = "Tích cực" if score > 0.2 else "Tiêu cực" if score < -0.2 else "Trung lập"
+        return {
+            "score": round(score, 2),
+            "sentiment": sentiment,
+            "recent_news": news_text,
+        }
+    except Exception as exc:
+        logger.warning(f"Failed to fetch news for {symbol}: {exc}")
+        return {
+            "score": 0.0,
+            "sentiment": "Trung lập",
+            "recent_news": "Không có tin tức",
+        }
+
+
 # ---------------------------------------------------------------------------
 # Insight execution
 # ---------------------------------------------------------------------------
@@ -194,16 +328,8 @@ async def generate_insight_for_symbol(
         return None
 
     technical_data = build_technical_data(df)
-    # Fundamental & sentiment are left empty for this standalone test
-    # because fetching real fundamentals requires additional vnstock APIs
-    # and sentiment requires news DB. The LLM will still generate insight
-    # based on technical data.
-    fundamental_data: Dict[str, Any] = {}
-    sentiment_data: Dict[str, Any] = {
-        "score": 0.0,
-        "sentiment": "Trung lập (không có dữ liệu tin tức trong chế độ test)",
-        "recent_news": "Không có tin tức"
-    }
+    fundamental_data = fetch_fundamental_data(symbol)
+    sentiment_data = fetch_sentiment_data(symbol)
 
     try:
         result = await insight_service.generate_insight(
@@ -325,7 +451,6 @@ def generate_json_report(results: List[Dict[str, Any]], output_path: Path) -> No
 async def main() -> None:
     settings = get_settings()
     selector = LLMProviderSelector(settings)
-    # Force OpenRouter while Beeknoee is down (502/504)
     provider = selector.select_provider(force_provider="openrouter")
     insight_service = InsightService(llm_provider=provider)
 
@@ -334,12 +459,39 @@ async def main() -> None:
     logger.info(f"Starting VN30 insight test — mode={mode}, provider={type(provider).__name__}")
 
     results: List[Dict[str, Any]] = []
+    request_times: deque[float] = deque()
+    success_count = 0
+    error_count = 0
+
     for symbol in VN30_SYMBOLS:
+        now = time.monotonic()
+        # Remove requests older than 60s from the window
+        while request_times and now - request_times[0] >= 60:
+            request_times.popleft()
+
+        # Rate-limit pacing: if we've sent >= OPENROUTER_RPM_LIMIT requests in the last 60s,
+        # sleep until the oldest request falls out of the window.
+        if len(request_times) >= OPENROUTER_RPM_LIMIT:
+            wait = 60 - (now - request_times[0]) + 1.0
+            logger.info(f"Rate limit pacing: sleep {wait:.1f}s before {symbol} (window full)")
+            await asyncio.sleep(max(1.0, wait))
+            now = time.monotonic()
+            while request_times and now - request_times[0] >= 60:
+                request_times.popleft()
+
         result = await generate_insight_for_symbol(insight_service, symbol, mode=mode)
         if result:
             results.append(result)
-        # Small delay to avoid rate limiting on free tiers
-        await asyncio.sleep(0.5)
+            if result.get("metadata", {}).get("error"):
+                error_count += 1
+            else:
+                success_count += 1
+
+        # Record approximate request time (retries happen inside the client)
+        request_times.append(time.monotonic())
+
+        # Base delay to stay well under 20 req/min on OpenRouter free tier
+        await asyncio.sleep(3.5)
 
     # Ensure output directory exists
     output_dir = current_dir / "test_results"
@@ -352,10 +504,11 @@ async def main() -> None:
     generate_markdown_report(results, md_path)
     generate_json_report(results, json_path)
 
-    logger.info("Done! Check the test_results/ folder.")
+    logger.info(f"Done! Success={success_count}, Errors={error_count}. Check the test_results/ folder.")
     print(f"\n✅ Hoàn tất! Kết quả được lưu tại:")
     print(f"   - Markdown: {md_path}")
     print(f"   - JSON    : {json_path}")
+    print(f"\n📊 Thống kê: {success_count} thành công / {error_count} lỗi / {len(VN30_SYMBOLS)} tổng số")
     print(f"\n💡 Gợi ý: Ngày mai hãy so sánh giá đóng cửa thực tế với:")
     print(f"   - Target Price (nếu Buy) để kiểm tra độ chính xác")
     print(f"   - Stop Loss để kiểm tra rủi ro")

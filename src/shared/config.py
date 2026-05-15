@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     openrouter_model: str = Field(default="openrouter/free", env="OPENROUTER_MODEL")
     openrouter_http_referer: Optional[str] = Field(default=None, env="OPENROUTER_HTTP_REFERER")
     openrouter_app_title: Optional[str] = Field(default=None, env="OPENROUTER_APP_TITLE")
+    openrouter_rpm_limit: int = Field(default=18, env="OPENROUTER_RPM_LIMIT")
+    openrouter_base_delay: float = Field(default=3.5, env="OPENROUTER_BASE_DELAY")
     beeknoee_api_key: Optional[str] = Field(default=None, env="BEEKNOEE_API_KEY")
     beeknoee_base_url: str = Field(
         default="https://platform.beeknoee.com/api/v1",

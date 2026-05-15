@@ -59,6 +59,15 @@ class LLMProviderSelector:
                 force_provider,
             )
 
+        # Respect explicit LLM_PROVIDER setting if configured
+        explicit = getattr(self.settings, 'llm_provider', None)
+        if explicit:
+            for name, _, factory in priority_order:
+                if name == explicit:
+                    logger.info("Using configured LLM provider: %s", explicit)
+                    return factory()
+            logger.warning("Configured LLM_PROVIDER %s not found in priority list; falling back", explicit)
+
         for name, key_configured, factory in priority_order:
             if key_configured:
                 logger.info("Using %s as LLM provider", name)

@@ -1,11 +1,13 @@
 """POST /api/analyze — LangGraph dashboard forecast (StockAnalyst client on .NET)."""
 import hashlib
+import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
@@ -131,6 +133,42 @@ def _llm_health_probe(llm: Any) -> Tuple[bool, Optional[str]]:
         return False, f"LLM probe timed out after {timeout_s:.0f}s"
     except Exception as exc:
         return False, _llm_failure_message(exc)
+
+
+def _save_trace(symbol: str, provider: str, total_ms: int, state: Dict[str, Any]) -> None:
+    """Persist a simplified execution trace to Redis for the management UI."""
+    try:
+        from src.infrastructure.queue.analyze_queue import get_redis_connection
+        conn = get_redis_connection()
+        trace = {
+            "id": f"trace:{symbol}:{int(time.time() * 1000)}",
+            "symbol": symbol,
+            "provider": provider,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "total_ms": total_ms,
+            "nodes": [
+                {"name": "context_loader", "status": "ok", "ms": 0, "parallel": False},
+                {"name": "news_analyst", "status": "ok" if state.get("news_agent_text") else "skipped", "ms": 0, "parallel": True},
+                {"name": "tech_analyst", "status": "ok" if state.get("tech_agent_text") else "skipped", "ms": 0, "parallel": True},
+                {"name": "bull_researcher", "status": "ok" if state.get("bull_arguments_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "bear_researcher", "status": "ok" if state.get("bear_arguments_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "research_manager", "status": "ok" if state.get("research_manager_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "trader", "status": "ok" if state.get("trader_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "aggressive_debator", "status": "ok" if state.get("aggressive_debator_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "neutral_debator", "status": "ok" if state.get("neutral_debator_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "conservative_debator", "status": "ok" if state.get("conservative_debator_text") else "skipped", "ms": 0, "parallel": False},
+                {"name": "risk_judge", "status": "ok" if state.get("forecast") else "skipped", "ms": 0, "parallel": False},
+            ],
+            "result": {
+                "forecast": state.get("forecast", "SIDEWAYS"),
+                "confidence": state.get("confidence", 50),
+                "reasoning": state.get("reasoning", ""),
+            },
+        }
+        conn.lpush("ai:traces", json.dumps(trace))
+        conn.ltrim("ai:traces", 0, 199)
+    except Exception as exc:
+        _log.warning("Failed to save trace: %s", exc)
 
 
 def _fallback_payload(symbol: str, hint: str) -> Dict[str, Any]:
@@ -342,7 +380,11 @@ async def analyze_stock(request: AnalyzeRequest):
             "tech_context": tech_ctx,
         }
 
+        start_ts = time.time()
         result = graph.invoke(state)
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+
+        _save_trace(symbol, provider, elapsed_ms, result)
 
         if cache is not None:
             cache.set(cache_key, result, ttl_seconds=ttl_seconds)

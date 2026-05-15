@@ -124,8 +124,15 @@ def run_analyze_job(
             os.environ.get("LANGGRAPH_LIGHT_MODE", "auto"),
         )
         result = graph.invoke(state)
-        elapsed = time.time() - start_ts
-        _log.info("run_analyze_job: done symbol=%s elapsed=%.1fs", symbol, elapsed)
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+        _log.info("run_analyze_job: done symbol=%s elapsed=%.1fs", symbol, elapsed_ms / 1000)
+
+        try:
+            from src.api.langgraph_analyze import _save_trace
+            _save_trace(symbol, forecast_provider, elapsed_ms, result)
+        except Exception as exc:
+            _log.warning("run_analyze_job: trace save failed: %s", exc)
+
         return result
     finally:
         if prev_provider is None:

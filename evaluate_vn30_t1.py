@@ -78,14 +78,18 @@ def evaluate_signal(
 
 
 def main() -> None:
-    # Find the latest insight JSON report
     results_dir = current_dir / "test_results"
-    json_files = sorted(results_dir.glob("vn30_insights_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not json_files:
-        print("❌ No insight JSON report found in test_results/")
-        sys.exit(1)
-
-    latest_json = json_files[0]
+    if len(sys.argv) > 1:
+        latest_json = Path(sys.argv[1])
+        if not latest_json.is_absolute():
+            latest_json = results_dir / latest_json.name
+    else:
+        # Find the latest insight JSON report
+        json_files = sorted(results_dir.glob("vn30_insights_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not json_files:
+            print("❌ No insight JSON report found in test_results/")
+            sys.exit(1)
+        latest_json = json_files[0]
     print(f"📂 Using insight report: {latest_json.name}")
 
     with open(latest_json, "r", encoding="utf-8") as f:
