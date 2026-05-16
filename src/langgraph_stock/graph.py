@@ -293,13 +293,20 @@ def _light_mode_enabled() -> bool:
     return provider == "beeknoee"
 
 
-def build_ta_graph(*, llm: Any, backend_base_url: str):
+def build_ta_graph(*, llm: Any, backend_base_url: str, progress_callback: Optional[Any] = None):
     """
     Build a multi-node TA pipeline inspired by TradingAgents.
 
     Note: We keep the final output schema aligned with the UI contract.
     """
     light_mode = _light_mode_enabled()
+
+    def _maybe_report(node_name: str, output: Dict[str, Any]) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(node_name, output)
+            except Exception:
+                _log.warning("Progress callback failed for %s", node_name, exc_info=True)
 
     def context_loader_node(state: TAState) -> Dict[str, Any]:
         """Fetch news + tech contexts in parallel.
@@ -351,7 +358,9 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             news_context = news_future.result()
             tech_context = tech_future.result()
 
-        return {"news_context": news_context, "tech_context": tech_context}
+        output = {"news_context": news_context, "tech_context": tech_context}
+        _maybe_report("context_loader", output)
+        return output
 
     def news_analyst_node(state: TAState) -> Dict[str, Any]:
         symbol = state["symbol"]
@@ -361,7 +370,8 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
         system_prompt = (
             f"Bạn là News Analyst cổ phiếu (mã {symbol}, thị trường chứng khoán Việt Nam). "
             "Bạn CHỈ được dùng NEWS_CONTEXT dưới đây. "
-            "Nếu không có đủ tin, hãy nói rõ thiếu dữ liệu và không bịa."
+            "Nếu không có đủ tin, hãy nói rõ thiếu dữ liệu và không bịa. "
+            "Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"=== NEWS_CONTEXT ===\n{news_context}\n\n"
@@ -377,9 +387,11 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             news_agent_text = response.content
         except Exception as e:
             news_agent_text = f"(News Analyst LLM unavailable: {_llm_failure_message(e)})"
-        return {
+        output = {
             "news_agent_text": news_agent_text,
         }
+        _maybe_report("news_analyst", output)
+        return output
 
     def tech_analyst_node(state: TAState) -> Dict[str, Any]:
         tech_context = state.get("tech_context", "") or ""
@@ -387,7 +399,8 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
         system_prompt = (
             f"Bạn là Technical Analyst cổ phiếu (mã {state['symbol']}). "
             "Bạn CHỈ được dùng TECH_CONTEXT dưới đây (giá/volume/chỉ báo). "
-            "Nếu dữ liệu không đủ, hãy ghi rõ n/a và không bịa."
+            "Nếu dữ liệu không đủ, hãy ghi rõ n/a và không bịa. "
+            "Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"=== TECH_CONTEXT ===\n{tech_context}\n\n"
@@ -403,16 +416,18 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             tech_agent_text = response.content
         except Exception as e:
             tech_agent_text = f"(Tech Analyst LLM unavailable: {_llm_failure_message(e)})"
-        return {
+        output = {
             "tech_agent_text": tech_agent_text,
         }
+        _maybe_report("tech_analyst", output)
+        return output
 
     def bull_researcher_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Bull Researcher (cổ phiếu). "
             "Dựa vào news_agent_text và tech_agent_text, "
             "lập luận theo hướng tăng/UP trong ngắn hạn nếu đủ dữ liệu. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"NEWS AGENT (text):\n{state.get('news_agent_text','')}\n\n"
@@ -428,14 +443,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             bull_text = response.content
         except Exception as e:
             bull_text = f"(Bull Researcher LLM unavailable: {_llm_failure_message(e)})"
-        return {"bull_arguments_text": bull_text}
+        output = {"bull_arguments_text": bull_text}
+        _maybe_report("bull_researcher", output)
+        return output
 
     def bear_researcher_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Bear Researcher (cổ phiếu). "
             "Dựa vào news_agent_text và tech_agent_text, "
             "lập luận theo hướng giảm hoặc điều chỉnh trong ngắn hạn. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"NEWS AGENT (text):\n{state.get('news_agent_text','')}\n\n"
@@ -451,14 +468,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             bear_text = response.content
         except Exception as e:
             bear_text = f"(Bear Researcher LLM unavailable: {_llm_failure_message(e)})"
-        return {"bear_arguments_text": bear_text}
+        output = {"bear_arguments_text": bear_text}
+        _maybe_report("bear_researcher", output)
+        return output
 
     def research_manager_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Research Manager. "
             "Tổng hợp bull_arguments_text và bear_arguments_text. "
             "Chỉ ra điểm nào thuyết phục hơn và cần theo dõi thêm gì. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"BULL:\n{state.get('bull_arguments_text','')}\n\n"
@@ -474,14 +493,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             manager_text = response.content
         except Exception as e:
             manager_text = f"(Research Manager LLM unavailable: {_llm_failure_message(e)})"
-        return {"research_manager_text": manager_text}
+        output = {"research_manager_text": manager_text}
+        _maybe_report("research_manager", output)
+        return output
 
     def trader_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Trader (cổ phiếu). "
             "Dựa vào research_manager_text, news_agent_text và tech_agent_text, "
             "đưa ra hướng dự báo và mức tự tin cho ngắn hạn. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"RESEARCH_MANAGER:\n{state.get('research_manager_text','')}\n\n"
@@ -498,14 +519,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             trader_text = response.content
         except Exception as e:
             trader_text = f"(Trader LLM unavailable: {_llm_failure_message(e)})"
-        return {"trader_text": trader_text}
+        output = {"trader_text": trader_text}
+        _maybe_report("trader", output)
+        return output
 
     def aggressive_debator_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Aggressive Debator (về rủi ro). "
             "Dựa vào news_context/tech_context và các phân tích trước, "
             "phản biện hướng dự báo và liệt kê rủi ro có thể đảo chiều nhanh. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"NEWS_CONTEXT:\n{state.get('news_context','')}\n\n"
@@ -522,14 +545,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             text = response.content
         except Exception as e:
             text = f"(Aggressive Debator LLM unavailable: {_llm_failure_message(e)})"
-        return {"aggressive_debator_text": text}
+        output = {"aggressive_debator_text": text}
+        _maybe_report("aggressive_debator", output)
+        return output
 
     def neutral_debator_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Neutral Debator (về rủi ro). "
             "Đánh giá cân bằng rủi ro vs cơ hội, "
             "liệt kê những điều kiện có thể khiến dự báo sai. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"RESEARCH_MANAGER:\n{state.get('research_manager_text','')}\n\n"
@@ -545,14 +570,16 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             text = response.content
         except Exception as e:
             text = f"(Neutral Debator LLM unavailable: {_llm_failure_message(e)})"
-        return {"neutral_debator_text": text}
+        output = {"neutral_debator_text": text}
+        _maybe_report("neutral_debator", output)
+        return output
 
     def conservative_debator_node(state: TAState) -> Dict[str, Any]:
         system_prompt = (
             "Bạn là Conservative Debator (về rủi ro). "
             "Hãy nêu các kịch bản rủi ro theo hướng xấu nhất hợp lý dựa trên context, "
             "và gợi ý cách phòng ngừa. "
-            "Không bịa."
+            "Không bịa. Trả lờibằng tiếng Việt."
         )
         human_prompt = (
             f"TECH_CONTEXT:\n{state.get('tech_context','')}\n\n"
@@ -568,7 +595,9 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             text = response.content
         except Exception as e:
             text = f"(Conservative Debator LLM unavailable: {_llm_failure_message(e)})"
-        return {"conservative_debator_text": text}
+        output = {"conservative_debator_text": text}
+        _maybe_report("conservative_debator", output)
+        return output
 
     def risk_judge_node(state: TAState) -> Dict[str, Any]:
         symbol = state["symbol"]
@@ -578,7 +607,8 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
         system_prompt = (
             f"Bạn là Risk Judge cho cổ phiếu {symbol}. "
             "Bạn KHÔNG được bịa tin tức hay số liệu ngoài hai khối context đã cho. "
-            "Trả về TUYỆT ĐỐI JSON hợp lệ, không markdown, không text rác ngoài JSON."
+            "Trả về TUYỆT ĐỐI JSON hợp lệ, không markdown, không text rác ngoài JSON. "
+            "Tất cả các trường string trong JSON phải là tiếng Việt."
         )
         debator_block = ""
         if not light_mode:
@@ -623,7 +653,7 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
             )
         except Exception as e:
             hint = _llm_failure_message(e)
-            return {
+            fallback = {
                 "symbol": symbol,
                 "forecast": "SIDEWAYS",
                 "confidence": 50,
@@ -640,6 +670,8 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
                 "tech_evidence": {},
                 "risk_conditions": [],
             }
+            _maybe_report("risk_judge", fallback)
+            return fallback
         try:
             parsed = _parse_json_strict(response.content)
 
@@ -665,10 +697,11 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
                 "final_decision": debate_summary.get("final_decision", ""),
             }
             parsed["symbol"] = symbol
+            _maybe_report("risk_judge", parsed)
             return parsed
         except Exception:
             # If the model returns non-JSON output, degrade gracefully.
-            return {
+            fallback = {
                 "symbol": symbol,
                 "forecast": "SIDEWAYS",
                 "confidence": 50,
@@ -682,6 +715,8 @@ def build_ta_graph(*, llm: Any, backend_base_url: str):
                 "tech_evidence": {},
                 "risk_conditions": [],
             }
+            _maybe_report("risk_judge", fallback)
+            return fallback
 
     # Build graph
     workflow = StateGraph(TAState)

@@ -14,8 +14,10 @@ existing cache/VNStock infra already validated the credentials.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import redis
@@ -74,6 +76,28 @@ def get_analyze_queue() -> Any:
     return _queue
 
 
+def _save_progress(job_id: str, node_name: str, output: Dict[str, Any]) -> None:
+    """Append a step to the analysis progress list in Redis (used by worker)."""
+    try:
+        conn = get_redis_connection()
+        key = f"analyze:progress:{job_id}"
+        raw = conn.get(key)
+        steps: List[Dict[str, Any]] = []
+        if raw is not None:
+            try:
+                steps = json.loads(raw.decode("utf-8")) if isinstance(raw, bytes) else json.loads(raw)
+            except Exception:
+                steps = []
+        steps.append({
+            "node": node_name,
+            "output": output,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        conn.setex(key, 3600, json.dumps(steps, ensure_ascii=False, default=str))
+    except Exception as exc:
+        _log.warning("Failed to save progress for job %s node %s: %s", job_id, node_name, exc)
+
+
 def run_analyze_job(
     symbol: str,
     news_context: str = "",
@@ -106,7 +130,28 @@ def run_analyze_job(
 
         llm = _build_llm()
         backend_base_url = os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
-        graph = build_ta_graph(llm=llm, backend_base_url=backend_base_url)
+
+        # Resolve job id from RQ so progress can be reported.
+        try:
+            from rq import get_current_job
+            job = get_current_job()
+            job_id = job.id if job else None
+        except Exception:
+            job_id = None
+
+        progress_callback = None
+        if job_id:
+            def _make_callback(jid: str):
+                def callback(node_name: str, output: Dict[str, Any]) -> None:
+                    _save_progress(jid, node_name, output)
+                return callback
+            progress_callback = _make_callback(job_id)
+
+        graph = build_ta_graph(
+            llm=llm,
+            backend_base_url=backend_base_url,
+            progress_callback=progress_callback,
+        )
 
         state = {
             "symbol": symbol,

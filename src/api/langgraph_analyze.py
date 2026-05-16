@@ -1,4 +1,5 @@
 """POST /api/analyze — LangGraph dashboard forecast (StockAnalyst client on .NET)."""
+import asyncio
 import hashlib
 import json
 import logging
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
@@ -27,6 +28,10 @@ load_dotenv()
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 _log = logging.getLogger(__name__)
+
+# Dedicated executor for the long-running LangGraph so it does not starve
+# FastAPI's default thread pool used by other endpoints (e.g. /api/analyze/progress).
+_GRAPH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="langgraph")
 
 router = APIRouter()
 
@@ -169,6 +174,70 @@ def _save_trace(symbol: str, provider: str, total_ms: int, state: Dict[str, Any]
         conn.ltrim("ai:traces", 0, 199)
     except Exception as exc:
         _log.warning("Failed to save trace: %s", exc)
+
+
+def _get_progress_redis() -> Optional[Any]:
+    """Return a dedicated redis-py client with decode_responses=True for progress.
+    Fail-open: returns None so callers can skip persistence.
+    """
+    try:
+        settings = get_settings()
+        import redis as _redis
+        return _redis.Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password or None,
+            decode_responses=True,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+        )
+    except Exception as exc:
+        _log.warning("Progress Redis unavailable: %s", exc)
+        return None
+
+
+def _save_progress(job_id: str, node_name: str, output: Dict[str, Any]) -> None:
+    """Append a step to the analysis progress list in Redis."""
+    conn = _get_progress_redis()
+    if conn is None:
+        _log.debug("Progress Redis unavailable; skipping progress for job=%s node=%s", job_id, node_name)
+        return
+    key = f"analyze:progress:{job_id}"
+    try:
+        raw = conn.get(key)
+        steps: List[Dict[str, Any]] = []
+        if raw is not None:
+            try:
+                steps = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            except Exception:
+                steps = []
+        steps.append({
+            "node": node_name,
+            "output": output,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        conn.setex(key, 3600, json.dumps(steps, ensure_ascii=False, default=str))
+        _log.info("Progress saved job=%s node=%s step=%d", job_id, node_name, len(steps))
+    except Exception as exc:
+        _log.warning("Failed to save progress for job %s node %s: %s", job_id, node_name, exc)
+
+
+def _get_progress(job_id: str) -> List[Dict[str, Any]]:
+    """Return the progress steps for a job (empty list on miss/error)."""
+    conn = _get_progress_redis()
+    if conn is None:
+        return []
+    key = f"analyze:progress:{job_id}"
+    try:
+        raw = conn.get(key)
+        if raw is None:
+            return []
+        return json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        _log.warning("Failed to get progress for job %s: %s", job_id, exc)
+        return []
 
 
 def _fallback_payload(symbol: str, hint: str) -> Dict[str, Any]:
@@ -333,10 +402,11 @@ def _build_llm():
 
 
 @router.post("/analyze")
-async def analyze_stock(request: AnalyzeRequest):
+async def analyze_stock(request: AnalyzeRequest, req: Request):
     symbol = _normalize_symbol(request.symbol)
     news_ctx = request.news_context or ""
     tech_ctx = request.tech_context or ""
+    job_id = req.headers.get("x-forecast-job-id", "").strip()
 
     cache = _get_analyze_cache()
     cache_key = _cache_key(symbol, news_ctx, tech_ctx)
@@ -372,7 +442,19 @@ async def analyze_stock(request: AnalyzeRequest):
     try:
         backend_base_url = os.getenv("BACKEND_BASE_URL", "http://localhost:5197")
 
-        graph = build_ta_graph(llm=llm, backend_base_url=backend_base_url)
+        progress_callback = None
+        if job_id:
+            def _make_callback(jid: str):
+                def callback(node_name: str, output: Dict[str, Any]) -> None:
+                    _save_progress(jid, node_name, output)
+                return callback
+            progress_callback = _make_callback(job_id)
+
+        graph = build_ta_graph(
+            llm=llm,
+            backend_base_url=backend_base_url,
+            progress_callback=progress_callback,
+        )
 
         state = {
             "symbol": symbol,
@@ -381,7 +463,8 @@ async def analyze_stock(request: AnalyzeRequest):
         }
 
         start_ts = time.time()
-        result = graph.invoke(state)
+        # Offload to a dedicated executor so progress polling endpoints stay responsive.
+        result = await asyncio.get_event_loop().run_in_executor(_GRAPH_EXECUTOR, graph.invoke, state)
         elapsed_ms = int((time.time() - start_ts) * 1000)
 
         _save_trace(symbol, provider, elapsed_ms, result)
@@ -552,3 +635,10 @@ async def get_analyze_job(job_id: str):
         status_code=202,
         content={"status": status, "jobId": job_id},
     )
+
+
+@router.get("/analyze/progress/{job_id}")
+async def get_analyze_progress(job_id: str):
+    """Return the thinking steps accumulated so far for a job."""
+    steps = _get_progress(job_id)
+    return {"jobId": job_id, "steps": steps}

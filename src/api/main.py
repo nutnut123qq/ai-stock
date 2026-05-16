@@ -231,6 +231,7 @@ app.include_router(financial_yf.router, tags=["financial"])
 app.include_router(management.router, prefix="/api", tags=["management"])
 
 
+
 @app.get("/")
 async def root():
     """Root endpoint."""

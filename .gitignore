@@ -47,3 +47,13 @@ Thumbs.db
 test_results/
 *.db
 *.sqlite
+
+# Log files
+*.log
+
+# Temporary test data / JSON artifacts
+prices_may4_15.json
+test_vnstock_result.json
+vci_events_test.json
+vnstock_data_compare.json
+vnstock_data_events_test.json

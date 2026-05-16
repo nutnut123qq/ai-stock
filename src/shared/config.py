@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     vnstock_cache_quote_ttl: int = Field(default=45, env="VNSTOCK_CACHE_QUOTE_TTL")
     vnstock_cache_history_ttl: int = Field(default=21600, env="VNSTOCK_CACHE_HISTORY_TTL")
     vnstock_cache_symbols_ttl: int = Field(default=86400, env="VNSTOCK_CACHE_SYMBOLS_TTL")
+    vnstock_cache_news_ttl: int = Field(default=1800, env="VNSTOCK_CACHE_NEWS_TTL")
+    vnstock_cache_events_ttl: int = Field(default=3600, env="VNSTOCK_CACHE_EVENTS_TTL")
 
     @field_validator("cors_origins", mode="before")
     @classmethod
